@@ -1,0 +1,9 @@
+streamlit==1.31.0
+easyocr==1.7.1
+opencv-python==4.8.1.78
+numpy==1.26.3
+pandas==2.1.4
+psycopg2-binary==2.9.9
+matplotlib==3.8.2
+python-dotenv==1.0.0
+streamlit-option-menu==0.3.12

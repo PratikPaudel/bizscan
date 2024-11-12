@@ -2,16 +2,23 @@ import pandas as pd
 import streamlit as st
 from streamlit_option_menu import option_menu
 import easyocr
-import psycopg2
-from psycopg2 import pool
 import cv2
 import os
 import matplotlib.pyplot as plt
 import re
-from contextlib import contextmanager
 import time
 from typing import Optional, Dict, Any
 import numpy as np
+from dotenv import load_dotenv
+from supabase import create_client
+
+load_dotenv()
+url = os.getenv("SUPABASE_URL")
+key = os.getenv("SUPABASE_KEY")
+if not url or not key:
+    st.error("Missing Supabase configuration. Please check your .env file.")
+    st.stop()
+supabase = create_client(url, key)
 
 
 def load_css():
@@ -207,6 +214,223 @@ def load_css():
     )
 
 
+def extract_email(text: str) -> Optional[str]:
+    """Extract email address from text"""
+    email_pattern = r"[\w\.-]+@[\w\.-]+\.\w+"
+    email_match = re.search(email_pattern, text)
+    if email_match:
+        email = email_match.group(0)
+        return email.strip()
+    return None
+
+
+def extract_phone(text: str) -> Optional[str]:
+    """Extract phone number from text"""
+    phone_pattern = r"(?:\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}"
+    phone_match = re.search(phone_pattern, text)
+    if phone_match:
+        phone = phone_match.group(0)
+        return re.sub(r"[^\d+]", "", phone)
+    return None
+
+
+def extract_website(text: str) -> Optional[str]:
+    """Extract website from text"""
+    if "@" in text:  # Skip email addresses
+        return None
+    website_pattern = (
+        r"(?:www\.)?[a-zA-Z0-9][a-zA-Z0-9-]+\.[a-zA-Z]{2,}(?:\.[a-zA-Z]{2,})?"
+    )
+    website_match = re.search(website_pattern, text.lower())
+    if website_match:
+        website = website_match.group(0)
+        return f"www.{website}" if not website.startswith("www.") else website
+    return None
+
+
+def extract_address(text: str) -> Optional[str]:
+    """Extract street address from text"""
+    address_pattern = r"\d+\s+[A-Za-z\s,]+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr)\b"
+    address_match = re.search(address_pattern, text)
+    return address_match.group(0) if address_match else None
+
+
+def process_card_image(image: np.ndarray, text_boxes: list) -> plt.Figure:
+    """Process and display card image with detected text boxes"""
+    fig = plt.figure(figsize=(15, 15))
+    ax = fig.add_subplot(111)
+
+    for coords, text, prob in text_boxes:
+        top_left = tuple(map(int, coords[0]))
+        bottom_right = tuple(map(int, coords[2]))
+        cv2.rectangle(image, top_left, bottom_right, (0, 255, 0), 2)
+
+    ax.imshow(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    ax.axis("off")
+    return fig
+
+
+def extract_card_info(ocr_result: list) -> pd.DataFrame:
+    """Extract information from OCR result"""
+    info = {
+        "full_name": "",
+        "organization": "",
+        "job_title": "",
+        "contact_number": "",
+        "business_email": "",
+        "business_url": "",
+        "street_address": "",
+        "location_city": "",
+        "location_state": "",
+        "postal_code": "",
+    }
+
+    # First pass: look for email specifically
+    for text in ocr_result:
+        text = text.strip()
+        email = extract_email(text)
+        if email:
+            info["business_email"] = email
+            break
+
+    # Second pass: extract other information
+    for idx, text in enumerate(ocr_result):
+        text = text.strip()
+        if not text:
+            continue
+
+        # Skip if this line was already identified as email
+        if text == info["business_email"]:
+            continue
+
+        phone = extract_phone(text)
+        if phone:
+            info["contact_number"] = phone
+            continue
+
+        website = extract_website(text)
+        if website:
+            info["business_url"] = website
+            continue
+
+        address = extract_address(text)
+        if address:
+            info["street_address"] = address
+            continue
+
+        # Handle name and title
+        if idx == 0 and not any(char.isdigit() for char in text):
+            info["full_name"] = text
+        elif idx == 1 and not any(
+            domain in text.lower() for domain in [".com", ".org", ".net"]
+        ):
+            info["job_title"] = text
+
+    return pd.DataFrame([info])
+
+
+# Database functions
+def save_to_database(df: pd.DataFrame) -> bool:
+    """Save contact information to database"""
+    try:
+        data = {
+            "full_name": df.iloc[0]["full_name"],
+            "organization": df.iloc[0]["organization"],
+            "job_title": df.iloc[0]["job_title"],
+            "contact_number": df.iloc[0]["contact_number"],
+            "business_email": df.iloc[0]["business_email"],
+            "business_url": df.iloc[0]["business_url"],
+            "street_address": df.iloc[0]["street_address"],
+            "location_city": df.iloc[0]["location_city"],
+            "location_state": df.iloc[0]["location_state"],
+            "postal_code": df.iloc[0]["postal_code"],
+        }
+
+        response = supabase.table("contact_info").insert(data).execute()
+        print("Insert response:", response)  # For debugging
+        return True
+    except Exception as e:
+        st.error(f"Failed to save to database: {str(e)}")
+        print(f"Database error details: {str(e)}")
+        return False
+
+
+def get_all_contacts() -> pd.DataFrame:
+    """Retrieve all contacts from database"""
+    try:
+        response = (
+            supabase.table("contact_info")
+            .select("*")
+            .order("created_at", desc=True)
+            .execute()
+        )
+
+        if response.data:
+            df = pd.DataFrame(response.data)
+            # Rename columns to match display format
+            column_mapping = {
+                "full_name": "Name",
+                "organization": "Organization",
+                "job_title": "Title",
+                "contact_number": "Phone",
+                "business_email": "Email",
+                "business_url": "Website",
+                "street_address": "Address",
+                "location_city": "City",
+                "location_state": "State",
+                "postal_code": "Postal Code",
+            }
+            df = df.rename(columns=column_mapping)
+            # Select only the columns we want to display
+            display_columns = list(column_mapping.values())
+            return df[display_columns]
+        return pd.DataFrame()
+    except Exception as e:
+        st.error(f"Failed to fetch contacts: {str(e)}")
+        print(f"Database error details: {str(e)}")
+        return pd.DataFrame()
+
+
+def update_contact(name: str, updated_data: Dict[str, Any]) -> bool:
+    """Update contact information"""
+    try:
+        data = {
+            "organization": updated_data["Organization"],
+            "job_title": updated_data["Title"],
+            "contact_number": updated_data["Phone"],
+            "business_email": updated_data["Email"],
+            "business_url": updated_data["Website"],
+            "street_address": updated_data["Address"],
+            "location_city": updated_data["City"],
+            "location_state": updated_data["State"],
+            "postal_code": updated_data["Postal Code"],
+        }
+
+        response = (
+            supabase.table("contact_info").update(data).eq("full_name", name).execute()
+        )
+        print("Update response:", response)  # For debugging
+        return True
+    except Exception as e:
+        st.error(f"Failed to update contact: {str(e)}")
+        print(f"Database error details: {str(e)}")
+        return False
+
+
+def delete_contact(name: str) -> bool:
+    """Delete contact from database"""
+    try:
+        response = (
+            supabase.table("contact_info").delete().eq("full_name", name).execute()
+        )
+        print("Delete response:", response)  # For debugging
+        return True
+    except Exception as e:
+        st.error(f"Failed to delete contact: {str(e)}")
+        print(f"Database error details: {str(e)}")
+        return False
+
+
 def main():
     load_css()
 
@@ -268,6 +492,11 @@ def main():
                 with st.spinner("Processing image..."):
                     # Process image and show it
                     image = cv2.imread(file_path)
+                    if image is None:
+                        st.error(
+                            "Failed to load image. Please ensure it's a valid image file."
+                        )
+                        return
                     detected_text = scanner.readtext(file_path)
                     fig = process_card_image(image, detected_text)
                     st.pyplot(fig)
@@ -307,17 +536,17 @@ def main():
 
                     submit = st.form_submit_button("Save Contact")
 
-                    if submit:
-                        edited_df = pd.DataFrame([edited_info])
-                        if save_to_database(edited_df):
-                            st.success("Contact saved successfully!")
-                            # Clean up uploaded file
-                            if os.path.exists(file_path):
-                                os.remove(file_path)
+                if submit:
+                    edited_df = pd.DataFrame([edited_info])
+                    if save_to_database(edited_df):
+                        st.success("Contact saved successfully!")
+                        # Clean up uploaded file
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
 
-                        # Show raw OCR text in an expander
-                        with st.expander("View Raw OCR Text", expanded=False):
-                            st.text(raw_text)
+                    # Show raw OCR text in an expander
+                    with st.expander("View Raw OCR Text", expanded=False):
+                        st.text(raw_text)
 
             except Exception as e:
                 st.error(f"An error occurred: {str(e)}")
@@ -430,307 +659,6 @@ def main():
         unsafe_allow_html=True,
     )
 
-
-# Configuration and Constants
-DB_CONFIG = {
-    "host": "localhost", 
-    "port": "5432",
-    "database": "business_cards",
-    "user": "postgres",
-    "password": "postgres",
-}
-
-# Create a connection pool
-try:
-    connection_pool = psycopg2.pool.SimpleConnectionPool(
-        minconn=1, maxconn=10, **DB_CONFIG
-    )
-except Exception as e:
-    st.error(f"Failed to create connection pool: {str(e)}")
-    connection_pool = None
-
-
-@contextmanager
-def get_db_connection():
-    """Context manager for database connections"""
-    conn = connection_pool.getconn() if connection_pool else None
-    try:
-        if conn:
-            yield conn.cursor()
-            conn.commit()
-        else:
-            raise Exception("No database connection available")
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        raise e
-    finally:
-        if conn:
-            connection_pool.putconn(conn)
-
-
-def init_database():
-    """Initialize database tables"""
-    try:
-        with get_db_connection() as cursor:
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS contact_info
-                (id SERIAL PRIMARY KEY,
-                 full_name TEXT,
-                 organization TEXT,
-                 job_title TEXT,
-                 contact_number VARCHAR(50),
-                 business_email TEXT,
-                 business_url TEXT,
-                 street_address TEXT,
-                 location_city TEXT,
-                 location_state TEXT,
-                 postal_code VARCHAR(10),
-                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                 last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP)
-            """
-            )
-    except Exception as e:
-        st.error(f"Database initialization failed: {str(e)}")
-
-
-# Helper functions for text extraction
-def extract_email(text: str) -> Optional[str]:
-    """Extract email address from text"""
-    email_pattern = (
-        r"[a-zA-Z0-9._%+-]+[-.]*@[a-zA-Z0-9.-]+[-.]*[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"
-    )
-    email_match = re.search(email_pattern, text)
-    if email_match:
-        email = email_match.group(0)
-        # Clean up and reconstruct the email if needed
-        parts = email.split("@")
-        if len(parts) == 2:
-            username, domain = parts
-            # Ensure dots are preserved in domain
-            domain = domain.replace(" ", ".")
-            return f"{username}@{domain}"
-    return None
-
-
-def extract_phone(text: str) -> Optional[str]:
-    """Extract phone number from text"""
-    phone_pattern = r"(?:\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}"
-    phone_match = re.search(phone_pattern, text)
-    if phone_match:
-        phone = phone_match.group(0)
-        return re.sub(r"[^\d+]", "", phone)
-    return None
-
-
-def extract_website(text: str) -> Optional[str]:
-    """Extract website from text"""
-    if "@" in text:  # Skip email addresses
-        return None
-    website_pattern = (
-        r"(?:www\.)?[a-zA-Z0-9][a-zA-Z0-9-]+\.[a-zA-Z]{2,}(?:\.[a-zA-Z]{2,})?"
-    )
-    website_match = re.search(website_pattern, text.lower())
-    if website_match:
-        website = website_match.group(0)
-        return f"www.{website}" if not website.startswith("www.") else website
-    return None
-
-
-def extract_address(text: str) -> Optional[str]:
-    """Extract street address from text"""
-    address_pattern = r"\d+\s+[A-Za-z\s,]+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr)\b"
-    address_match = re.search(address_pattern, text)
-    return address_match.group(0) if address_match else None
-
-
-def process_card_image(image: np.ndarray, text_boxes: list) -> plt.Figure:
-    """Process and display card image with detected text boxes"""
-    fig = plt.figure(figsize=(15, 15))
-    ax = fig.add_subplot(111)
-
-    for coords, text, prob in text_boxes:
-        top_left = tuple(map(int, coords[0]))
-        bottom_right = tuple(map(int, coords[2]))
-        cv2.rectangle(image, top_left, bottom_right, (0, 255, 0), 2)
-
-    ax.imshow(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-    ax.axis("off")
-    return fig
-
-
-def extract_card_info(ocr_result: list) -> pd.DataFrame:
-    """Extract information from OCR result"""
-    info = {
-        "full_name": "",
-        "organization": "",
-        "job_title": "",
-        "contact_number": "",
-        "business_email": "",
-        "business_url": "",
-        "street_address": "",
-        "location_city": "",
-        "location_state": "",
-        "postal_code": "",
-        "raw_text": "\n".join(ocr_result),
-    }
-
-    for idx, text in enumerate(ocr_result):
-        text = text.strip()
-        if not text:
-            continue
-
-        # Extract information using helper functions
-        email = extract_email(text)
-        if email:
-            info["business_email"] = email
-            continue
-
-        phone = extract_phone(text)
-        if phone:
-            info["contact_number"] = phone
-            continue
-
-        website = extract_website(text)
-        if website:
-            info["business_url"] = website
-            continue
-
-        address = extract_address(text)
-        if address:
-            info["street_address"] = address
-            continue
-
-        # Handle name and title
-        if idx == 0 and not any(char.isdigit() for char in text):
-            info["full_name"] = text
-        elif idx == 1 and not any(
-            domain in text.lower() for domain in [".com", ".org", ".net"]
-        ):
-            info["job_title"] = text
-
-    return pd.DataFrame([info])
-
-
-def save_to_database(df: pd.DataFrame) -> bool:
-    """Save contact information to database"""
-    try:
-        with get_db_connection() as cursor:
-            insert_query = """
-                INSERT INTO contact_info 
-                (full_name, organization, job_title, contact_number, business_email, 
-                 business_url, street_address, location_city, location_state, postal_code)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """
-            # Extract only the needed columns in the correct order
-            values = (
-                df.iloc[0]["full_name"],
-                df.iloc[0]["organization"],
-                df.iloc[0]["job_title"],
-                df.iloc[0]["contact_number"],
-                df.iloc[0]["business_email"],
-                df.iloc[0]["business_url"],
-                df.iloc[0]["street_address"],
-                df.iloc[0]["location_city"],
-                df.iloc[0]["location_state"],
-                df.iloc[0]["postal_code"],
-            )
-
-            # Log the values for debugging
-            print("Inserting values:", values)
-
-            cursor.execute(insert_query, values)
-        return True
-    except Exception as e:
-        st.error(f"Failed to save to database: {str(e)}")
-        print(f"Database error details: {str(e)}")  # Detailed error logging
-        return False
-
-
-def get_all_contacts() -> pd.DataFrame:
-    """Retrieve all contacts from database"""
-    try:
-        with get_db_connection() as cursor:
-            cursor.execute(
-                """
-                SELECT full_name, organization, job_title, contact_number, 
-                       business_email, business_url, street_address, location_city, 
-                       location_state, postal_code
-                FROM contact_info 
-                ORDER BY created_at DESC
-            """
-            )
-            records = cursor.fetchall()
-            columns = [
-                "Name",
-                "Organization",
-                "Title",
-                "Phone",
-                "Email",
-                "Website",
-                "Address",
-                "City",
-                "State",
-                "Postal Code",
-            ]
-            return pd.DataFrame(records, columns=columns)
-    except Exception as e:
-        st.error(f"Failed to fetch contacts: {str(e)}")
-        return pd.DataFrame()
-
-
-def update_contact(name: str, updated_data: Dict[str, Any]) -> bool:
-    """Update contact information"""
-    try:
-        with get_db_connection() as cursor:
-            update_query = """
-                UPDATE contact_info 
-                SET organization = %s,
-                    job_title = %s,
-                    contact_number = %s,
-                    business_email = %s,
-                    business_url = %s,
-                    street_address = %s,
-                    location_city = %s,
-                    location_state = %s,
-                    postal_code = %s,
-                    last_modified = CURRENT_TIMESTAMP
-                WHERE full_name = %s
-            """
-            values = (
-                updated_data["Organization"],
-                updated_data["Title"],
-                updated_data["Phone"],
-                updated_data["Email"],
-                updated_data["Website"],
-                updated_data["Address"],
-                updated_data["City"],
-                updated_data["State"],
-                updated_data["Postal Code"],
-                name,
-            )
-            cursor.execute(update_query, values)
-        return True
-    except Exception as e:
-        st.error(f"Failed to update contact: {str(e)}")
-        return False
-
-
-def delete_contact(name: str) -> bool:
-    """Delete contact from database"""
-    try:
-        with get_db_connection() as cursor:
-            delete_query = "DELETE FROM contact_info WHERE full_name = %s"
-            cursor.execute(delete_query, (name,))
-        return True
-    except Exception as e:
-        st.error(f"Failed to delete contact: {str(e)}")
-        return False
-
-
-# Initialize database
-init_database()
 
 if __name__ == "__main__":
     main()

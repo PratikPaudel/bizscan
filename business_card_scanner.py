@@ -472,7 +472,7 @@ def main():
     if menu_choice == "Scan Card":
         st.markdown('<div class="upload-section">', unsafe_allow_html=True)
         uploaded_file = st.file_uploader(
-            "Upload Business Card Image",
+            "Upload Business Card Image (Demo Version - Please use non-sensitive/test data only)",
             type=["png", "jpg", "jpeg"],
             help="Supported formats: PNG, JPG, JPEG",
         )

@@ -101,6 +101,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Contact 📧
 
-Your Name - [prateekpaudel2017@gmail.com](mailto:prateekpaudel2017@gmail.com)
+Pratik Paudel - [prateekpaudel2017@gmail.com](mailto:prateekpaudel2017@gmail.com)
 
 Project Link: [https://github.com/pratikpaudel/bizscan](https://github.com/pratikpaudel/bizscan)
